@@ -12,9 +12,9 @@ from datetime import datetime, timezone
 from typing import Callable
 
 import docker
-from docker.errors import NotFound
 
 from monitor.alerter import AlertMailer
+from monitor.config import MonitorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -49,17 +49,20 @@ class PendingVerification:
 
 
 class VerificationMonitor:
-    def __init__(self, on_event: Callable[[str], None] | None = None) -> None:
-        self.container_name = os.environ.get(
-            "IDMP_CONTAINER_NAME", "idmp-tsdb-tdgpt-idmp"
-        )
+    def __init__(
+        self,
+        on_event: Callable[[str], None] | None = None,
+        config: MonitorConfig | None = None,
+    ) -> None:
+        self.container_name = os.environ.get("IDMP_CONTAINER_NAME", "idmp-monitor-idmp")
         self.timeout_seconds = int(os.environ.get("VERIFY_EMAIL_TIMEOUT_SECONDS", "90"))
         self.probe_interval = int(os.environ.get("PROBE_INTERVAL_SECONDS", "0"))
         self.idmp_base_url = os.environ.get(
-            "IDMP_BASE_URL", "http://host.docker.internal:6042"
+            "IDMP_BASE_URL", "http://tdengine-idmp:6042"
         ).rstrip("/")
         self.on_event = on_event or (lambda _msg: None)
-        self.alerter = AlertMailer()
+        self.config = config or MonitorConfig.load()
+        self.alerter = AlertMailer(self.config)
         self._pending: dict[str, PendingVerification] = {}
         self._lock = threading.Lock()
         self._recent_events: dict[str, float] = {}
@@ -266,7 +269,20 @@ class VerificationMonitor:
 
     def run(self) -> None:
         client = docker.from_env()
-        container = client.containers.get(self.container_name)
+        container = None
+        while container is None and not self._stop.is_set():
+            try:
+                container = client.containers.get(self.container_name)
+            except docker.errors.NotFound:
+                logger.warning(
+                    "Waiting for IDMP container %s to exist...",
+                    self.container_name,
+                )
+                time.sleep(10)
+
+        if container is None:
+            return
+
         logger.info("Streaming logs from container %s", self.container_name)
 
         watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)

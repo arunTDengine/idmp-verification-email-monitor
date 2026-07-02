@@ -1,16 +1,147 @@
+name: idmp-monitor
+
 services:
+  tdengine-tdgpt:
+    image: tdengine/tdgpt-full:latest
+    container_name: idmp-monitor-tdgpt
+    hostname: tdengine-tdgpt
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      TZ: UTC
+    ports:
+      - "6035:6035"
+      - "6036:6036"
+      - "6037:6037"
+    networks:
+      - idmp_net
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:6035').read()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  tdengine-tsdb:
+    image: tdengine/tsdb-ee:latest
+    container_name: idmp-monitor-tsdb
+    hostname: tdengine
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      TZ: UTC
+    ports:
+      - "6030:6030"
+      - "6041:6041"
+      - "6060:6060"
+    volumes:
+      - tsdb_data:/var/lib/taos
+      - tsdb_log:/var/log/taos
+      - ./init-anode.sql:/docker-entrypoint-initdb.d/init-anode.sql:ro
+    networks:
+      - idmp_net
+    depends_on:
+      tdengine-tdgpt:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "taos", "-h", "localhost", "-s", "show databases;"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  tdengine-idmp:
+    image: tdengine/idmp-ee:latest
+    container_name: idmp-monitor-idmp
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      tdengine-tsdb:
+        condition: service_healthy
+    environment:
+      TZ: UTC
+      TSDB_URL: "http://tdengine-tsdb:6041"
+      TDA_ANALYSIS_EVENT_URLS: "ws://tdengine-idmp:6042"
+      QUARKUS_PROFILE: prod
+      IDMP_URL: "http://localhost:6042"
+      TDA_AI_CONN_ZH: DeepSeek
+      TDA_AI_CONN_EN: OpenAI
+      AI_SERVER_URL: "http://tdengine-idmp-ai:6040"
+    ports:
+      - "6034:6034"
+      - "6038:6038"
+      - "6042:6042"
+    volumes:
+      - idmp_data:/var/lib/taos
+      - idmp_log:/var/log/taos
+    networks:
+      - idmp_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6042/q/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  tdengine-idmp-ai:
+    image: tdengine/idmp-ai-ee:latest
+    container_name: idmp-monitor-idmp-ai
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      TZ: UTC
+      IDMP_URL: "http://tdengine-idmp:6042"
+      IDMP_JAVA_API_URL: "http://tdengine-idmp:6042/"
+      TDA_AI_CONN_ZH: DeepSeek
+      TDA_AI_CONN_EN: OpenAI
+      OPENAI_API_KEY: ollama
+    ports:
+      - "6040:6040"
+    volumes:
+      - idmp_data:/var/lib/taos
+      - idmp_log:/var/log/taos
+    networks:
+      - idmp_net
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6040' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
   idmp-verification-monitor:
     build: .
     container_name: idmp-verification-monitor
     restart: unless-stopped
-    env_file:
-      - .env
+    depends_on:
+      tdengine-idmp:
+        condition: service_healthy
     environment:
+      CONFIG_PATH: /config/monitor-config.json
+      ALERTS_PATH: /config/alerts.jsonl
+      IDMP_CONTAINER_NAME: idmp-monitor-idmp
+      VERIFY_EMAIL_TIMEOUT_SECONDS: "90"
       MONITOR_PORT: "8088"
     ports:
-      - "${MONITOR_HOST_PORT:-18088}:8088"
+      - "18088:8088"
     volumes:
-      # Required so the monitor can stream logs from the IDMP container.
+      - ./data:/config
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    networks:
+      - idmp_net
+
+networks:
+  idmp_net:
+    driver: bridge
+
+volumes:
+  tsdb_data:
+  tsdb_log:
+  idmp_data:
+  idmp_log:

@@ -1,263 +1,118 @@
 # IDMP Verification Email Monitor
 
-Docker service that watches an IDMP container and alerts you when a **step-1 registration verification email** was requested but never confirmed as sent.
+One-command deployment for a **fresh IDMP + TSDB + TDGPT** stack with automatic verification-email monitoring.
 
-IDMP returns HTTP 204 from `POST /api/v1/users/send/register-code` before the mail worker finishes. This monitor closes that gap by tailing IDMP logs and correlating:
+No `.env` file. No manual configuration. On first run, enter the email address where you want alerts sent.
 
-1. register verification code generated for an email
-2. outbound SMTP attempt for that email
-3. `send msg success` from the IDMP mail worker
-
-If step 3 does not happen within the timeout, it emails your ops contact.
-
-## What it detects
-
-| Situation | Alert? |
-|-----------|--------|
-| User requests register verification code, email sends successfully | No |
-| User requests code, SMTP fails in IDMP logs | Yes |
-| User requests code, no SMTP attempt appears | Yes |
-| User requests code, SMTP attempted but no success log | Yes |
-| Optional proactive SMTP probe fails | Yes |
-
-## Prerequisites
-
-- Docker and Docker Compose on the same host as the IDMP container
-- IDMP already running (for example `idmp-tsdb-tdgpt-idmp`)
-- An SMTP account that can send alert emails to your team
-
-## Step 1 — Clone or copy this repository
+## Quick start
 
 ```bash
-cd ~
-git clone <your-repo-url> idmp-verification-email-monitor
+git clone https://github.com/arunTDengine/idmp-verification-email-monitor.git
 cd idmp-verification-email-monitor
+chmod +x start.sh
+./start.sh
 ```
 
-If you are using the local copy created on this machine:
-
-```bash
-cd ~/idmp-verification-email-monitor
-```
-
-## Step 2 — Configure environment variables
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```bash
-# Container name from: docker ps --filter name=idmp
-IDMP_CONTAINER_NAME=idmp-tsdb-tdgpt-idmp
-
-# Who gets alerted
-ALERT_TO=you@yourcompany.com
-ALERT_FROM=idmp-monitor@yourcompany.com
-
-# SMTP for alert emails (Gmail app password, SendGrid, SES SMTP, etc.)
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=you@yourcompany.com
-SMTP_PASSWORD=your-app-password
-SMTP_USE_TLS=true
-
-# How long to wait after step-1 request before alerting
-VERIFY_EMAIL_TIMEOUT_SECONDS=90
-
-# Host port for the monitor health endpoint
-MONITOR_HOST_PORT=18088
-```
-
-Find your IDMP container name:
-
-```bash
-docker ps --format '{{.Names}}' | grep idmp
-```
-
-## Step 3 — Build and start the monitor container
-
-```bash
-docker compose up -d --build
-```
-
-Check health:
-
-```bash
-curl -s http://localhost:18088/health | python3 -m json.tool
-```
-
-Expected:
-
-```json
-{
-  "status": "ok",
-  "service": "idmp-verification-email-monitor",
-  "container": "idmp-tsdb-tdgpt-idmp",
-  "stats": {
-    "events_seen": 0,
-    "successes": 0,
-    "failures": 0,
-    "timeouts": 0,
-    "pending_count": 0
-  }
-}
-```
-
-## Step 4 — Trigger a real IDMP step-1 verification request
-
-1. Open the IDMP setup UI, usually `http://localhost:6042`
-2. On the first registration step, enter an email and click **Send verification code**
-
-Or call the API directly:
-
-```bash
-curl -i -X POST 'http://localhost:6042/api/v1/users/send/register-code' \
-  -H 'Content-Type: application/json' \
-  -H 'Accept-Language: en-US' \
-  -d '{"email":"test@example.com"}'
-```
-
-## Step 5 — Confirm the monitor observed the flow
-
-```bash
-docker logs -f idmp-verification-monitor
-```
-
-You should see lines like:
+First run prompts:
 
 ```text
-register verification requested for test@example.com
-smtp send attempted for test@example.com
-verification email confirmed for test@example.com
+Alert email address: you@yourcompany.com
+SMTP app password (hidden): [optional - press Enter to skip]
 ```
 
-Refresh stats:
+Then the script will:
+
+1. Pull the **latest** `tdengine/idmp-ee`, `tdengine/tsdb-ee`, `tdengine/tdgpt-full`, and `tdengine/idmp-ai-ee` images
+2. Deploy a fresh stack (TDGPT → TSDB → IDMP → IDMP AI)
+3. Start the verification-email monitor automatically
+
+## URLs after startup
+
+| Service | URL |
+|---------|-----|
+| IDMP setup UI | http://localhost:6042 |
+| Monitor health | http://localhost:18088/health |
+| Monitor alerts | http://localhost:18088/alerts |
+
+## What the monitor checks
+
+When someone clicks **Send verification code** on IDMP step 1, the monitor tails IDMP logs and confirms:
+
+1. Verification code generated
+2. SMTP send attempted
+3. `send msg success` logged
+
+If delivery is not confirmed within 90 seconds, an alert is raised to your email (if SMTP password was provided) and always stored at `/alerts`.
+
+## Fresh redeploy (wipe data)
 
 ```bash
-curl -s http://localhost:18088/health | python3 -m json.tool
+./start.sh --fresh
 ```
 
-If email delivery succeeded, `successes` increments and **no alert email** is sent.
+This removes all volumes and deploys a completely clean IDMP stack.
 
-## Step 6 — Test the failure alert path
-
-To verify alerting works, temporarily break IDMP email settings in the UI, then request another verification code. Within `VERIFY_EMAIL_TIMEOUT_SECONDS`, the monitor should email `ALERT_TO` with:
-
-- recipient email
-- whether SMTP was attempted
-- timestamp
-- troubleshooting steps
-
-You can also watch the monitor decide a timeout:
+## Daily use
 
 ```bash
+./start.sh          # pull latest images and ensure stack is running
 docker logs -f idmp-verification-monitor
+curl http://localhost:18088/health
 ```
 
-## Optional: proactive SMTP connectivity probe
+Settings are saved in `data/monitor-config.json` (created on first run). You do not need to edit any env files.
 
-If you want the monitor to periodically call IDMP's built-in connectivity endpoint, set in `.env`:
+## Change alert email later
 
 ```bash
-PROBE_INTERVAL_SECONDS=3600
-IDMP_BASE_URL=http://host.docker.internal:6042
+rm data/monitor-config.json
+./start.sh
 ```
 
-Then restart:
+You will be prompted again on the next run.
 
-```bash
-docker compose up -d
-```
+## Optional SMTP password
 
-## How it works
+If you skip the SMTP password on first run, alerts appear in:
+
+- `docker logs idmp-verification-monitor`
+- http://localhost:18088/alerts
+
+To enable email delivery, remove `data/monitor-config.json` and run `./start.sh` again with an app password for your mailbox (Gmail app passwords work with the built-in defaults).
+
+## Architecture
 
 ```mermaid
 sequenceDiagram
     participant User
+    participant start.sh
     participant IDMP
     participant Monitor
-    participant OpsEmail
 
-    User->>IDMP: POST /users/send/register-code
-    IDMP->>IDMP: generate code + queue mail async
-    IDMP-->>User: HTTP 204
+    User->>start.sh: ./start.sh
+    start.sh->>start.sh: prompt alert email (first run)
+    start.sh->>IDMP: pull latest + deploy stack
+    start.sh->>Monitor: start log watcher
+    User->>IDMP: Send verification code (step 1)
     Monitor->>IDMP: tail docker logs
-    IDMP->>IDMP: SMTP send
-    alt send msg success in logs
-        Monitor->>Monitor: mark delivered
-    else failure or timeout
-        Monitor->>OpsEmail: alert email
+    alt email confirmed in logs
+        Monitor->>Monitor: record success
+    else failed or timeout
+        Monitor->>User: alert email / /alerts
     end
-```
-
-Log patterns matched inside the IDMP container:
-
-- `Sending register verify code for user@example.com: 123456`
-- `send email to user@example.com, title: Your TDengine IDMP account verification code`
-- `send msg success detailId: ...`
-- `send msg failed ...`
-
-## Operations
-
-```bash
-# Start
-docker compose up -d
-
-# Logs
-docker logs -f idmp-verification-monitor
-
-# Restart after .env changes
-docker compose up -d --build
-
-# Stop
-docker compose down
 ```
 
 ## Troubleshooting
 
-### Monitor cannot find IDMP container
+**Port conflicts** — Stop other IDMP stacks using ports 6030–6042, or edit port mappings in `docker-compose.yml`.
+
+**Monitor not seeing events** — Confirm IDMP container name is `idmp-monitor-idmp`:
 
 ```bash
-docker ps --format '{{.Names}}'
+docker ps --filter name=idmp-monitor
 ```
 
-Set `IDMP_CONTAINER_NAME` in `.env` to the exact name.
-
-### Monitor starts but never sees events
-
-- Ensure the monitor container has access to `/var/run/docker.sock`
-- Confirm register requests hit the same IDMP container you configured
-- Check IDMP logs manually:
-
-```bash
-docker logs idmp-tsdb-tdgpt-idmp 2>&1 | grep -i 'register-code\|verify code\|send email'
-```
-
-### Alerts not received
-
-- Verify SMTP credentials with a manual send test
-- Check spam folder
-- Inspect monitor logs for SMTP exceptions
-
-### False positives on busy systems
-
-Increase `VERIFY_EMAIL_TIMEOUT_SECONDS` if your SMTP relay is slow.
-
-## Security notes
-
-- The monitor needs read-only Docker socket access to stream logs.
-- Store SMTP credentials in `.env`; do not commit `.env`.
-- Alert emails may include the verification code from IDMP debug logs. Restrict `ALERT_TO` to trusted operators only.
-
-## Related IDMP APIs
-
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /api/v1/users/send/register-code` | Step-1 registration verification code |
-| `POST /api/v1/system/email/default-connectivity` | Test configured SMTP |
-| `GET /api/v1/system/email/config` | Read saved email settings |
+**IDMP slow to start** — First boot can take 2–3 minutes. `start.sh` waits for the health check.
 
 ## License
 
